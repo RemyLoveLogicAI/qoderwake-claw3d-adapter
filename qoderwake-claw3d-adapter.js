@@ -32,6 +32,7 @@ const QW_CLI = process.env.QW_CLI_BIN || "qoderwake";
 const AGENT_NAME = process.env.QW_AGENT_NAME || "Qoderwake";
 const DEFAULT_MODEL = process.env.QW_MODEL || "auto";
 const MAX_TOOL_ROUNDS = 8;
+const HEARTBEAT_INTERVAL_MS = 25000; // Slightly under Claw3D's 30s tickIntervalMs
 
 // ---------------------------------------------------------------------------
 // In-memory state
@@ -111,12 +112,14 @@ async function qwSessionCreate(wakerId, message, title, cwd) {
 }
 
 async function qwSessionSend(sessionId, message) {
+  // Short timeout — we only need to confirm the message was queued, not wait for the response.
+  // The response is consumed separately by qwSessionStream.
   const { stdout } = await qwCli([
     "session", "send",
     "--session-id", sessionId,
     "--message", message,
     "--format", "json",
-  ]);
+  ], 5000);
   return JSON.parse(stdout);
 }
 
@@ -323,6 +326,8 @@ function parseQwEvent(payload) {
 
 // ---------------------------------------------------------------------------
 // Agentic loop — runs a Qoderwake session and streams text back
+// Handles tool-use rounds: continues streaming through message_stop events
+// until the session actually goes idle (worker.status.changed → idle/stopped).
 // ---------------------------------------------------------------------------
 
 async function runQwSession({ sessionKey, sessionId, userMessage, emitDelta, abortCheck, sendEvent }) {
@@ -330,11 +335,20 @@ async function runQwSession({ sessionKey, sessionId, userMessage, emitDelta, abo
   let fullText = "";
   let hasContent = false;
   let textBuffer = "";
+  let messageStopCount = 0;     // Track message_stop events for tool-use rounds
+  let lastActivityAt = Date.now(); // For idle timeout detection
+  const IDLE_TIMEOUT_MS = 120000; // 2 min with no activity = session done
 
   try {
     while (true) {
       if (abortCheck && abortCheck()) {
         stream.abort();
+        break;
+      }
+
+      // Idle timeout: if no activity for IDLE_TIMEOUT_MS, consider the session done
+      if (Date.now() - lastActivityAt > IDLE_TIMEOUT_MS) {
+        console.log(`[qw-adapter] Session ${sessionId} idle timeout after ${IDLE_TIMEOUT_MS}ms`);
         break;
       }
 
@@ -348,22 +362,47 @@ async function runQwSession({ sessionKey, sessionId, userMessage, emitDelta, abo
 
       if (item.value?.type !== "data") continue;
 
+      lastActivityAt = Date.now();
       const data = item.value.data;
       const parsed = parseQwEvent(data?.payload);
+
+      // Track thinking activity for observability
+      if (parsed.thinking) {
+        console.log(`[qw-adapter] Session ${sessionId} thinking: ${parsed.thinking.slice(0, 80)}...`);
+      }
+
+      // Tool use detection: message_stop without text means a tool round boundary
+      if (parsed.isDone && parsed.eventType === "stream_event.stop") {
+        messageStopCount++;
+        // Don't break yet — the session may continue with tool results.
+        // Only break if we already have content AND we see a worker status change to idle.
+        // For now, flush any buffered text and continue listening.
+        if (textBuffer.length > 0) {
+          emitDelta(fullText);
+          textBuffer = "";
+        }
+        continue;
+      }
 
       if (parsed.textDelta) {
         fullText += parsed.textDelta;
         textBuffer += parsed.textDelta;
         hasContent = true;
         // Batch text updates to reduce frame rate
-        if (textBuffer.length > 20 || parsed.isDone) {
+        if (textBuffer.length > 20) {
           emitDelta(fullText);
           textBuffer = "";
         }
       }
 
-      if (parsed.isDone && hasContent) {
-        emitDelta(fullText);
+      // Worker status changed to idle/stopped = true completion
+      if (parsed.isDone && (parsed.eventType === "worker.status.changed" || parsed.eventType === "worker.state.snapshot")) {
+        if (hasContent) {
+          if (textBuffer.length > 0) {
+            emitDelta(fullText);
+            textBuffer = "";
+          }
+        }
         break;
       }
     }
@@ -587,6 +626,10 @@ async function handleMethod(method, params, id, sendEvent) {
           }
         } catch (err) {
           if (!aborted) {
+            // Clean up stale session — next attempt should create a fresh one
+            if (qwSession && clawSessionMap.get(sessionKey) === qwSession) {
+              clawSessionMap.delete(sessionKey);
+            }
             emitChat("error", { errorMessage: sanitizeErrorMessage(err) || "Qoderwake error" });
           } else {
             emitChat("aborted", {});
@@ -719,6 +762,7 @@ function startAdapter() {
   wss.on("connection", (ws) => {
     let connected = false;
     let globalSeq = 0;
+    let heartbeatTimer = null;
 
     const send = (frame) => {
       if (ws.readyState === ws.OPEN) {
@@ -735,6 +779,10 @@ function startAdapter() {
     activeSendEventFns.add(sendEventFn);
 
     send({ type: "event", event: "connect.challenge", payload: { nonce: randomId() } });
+
+    const clearHeartbeat = () => {
+      if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+    };
 
     ws.on("message", async (raw) => {
       let frame;
@@ -773,6 +821,10 @@ function startAdapter() {
             policy: { tickIntervalMs: 30000 },
           },
         });
+        // Start heartbeat after successful connect
+        heartbeatTimer = setInterval(() => {
+          send({ type: "event", event: "heartbeat", payload: { ts: Date.now(), activeRuns: activeRuns.size } });
+        }, HEARTBEAT_INTERVAL_MS);
         return;
       }
 
@@ -788,9 +840,13 @@ function startAdapter() {
       }
     });
 
-    ws.on("close", () => activeSendEventFns.delete(sendEventFn));
+    ws.on("close", () => {
+      clearHeartbeat();
+      activeSendEventFns.delete(sendEventFn);
+    });
     ws.on("error", (err) => {
       console.error("[qw-adapter] WebSocket error:", sanitizeErrorMessage(err));
+      clearHeartbeat();
       activeSendEventFns.delete(sendEventFn);
     });
   });
