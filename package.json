@@ -1,0 +1,13 @@
+{
+  "name": "qoderwake-claw3d-adapter",
+  "version": "0.1.0",
+  "description": "WebSocket adapter bridging Claw3D gateway protocol to Qoderwake CLI + SSE sessions",
+  "main": "qoderwake-claw3d-adapter.js",
+  "scripts": {
+    "start": "node qoderwake-claw3d-adapter.js",
+    "test": "node test/qoderwake-claw3d-adapter.test.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
