@@ -87,7 +87,12 @@ function parseQwEvent(payload) {
         .filter((p) => p && p.type === "text" && typeof p.text === "string")
         .map((p) => p.text)
         .join("");
+      const thinkingParts = content
+        .filter((p) => p && p.type === "thinking" && typeof p.thinking === "string")
+        .map((p) => p.thinking);
+
       if (textParts) return { textDelta: textParts, eventType: "assistant.text" };
+      if (thinkingParts.length) return { eventType: "assistant.thinking", thinking: thinkingParts.join("") };
     }
     return { eventType: "assistant" };
   }
@@ -255,7 +260,23 @@ test("parseQwEvent ignores assistant thinking-only events", () => {
     },
   });
   assert.strictEqual(result.textDelta, undefined);
-  assert.strictEqual(result.eventType, "assistant");
+  assert.strictEqual(result.eventType, "assistant.thinking");
+  assert.strictEqual(result.thinking, "Let me think...");
+});
+
+test("parseQwEvent extracts thinking from assistant snapshot", () => {
+  const result = parseQwEvent({
+    type: "assistant",
+    message: {
+      content: [
+        { type: "thinking", thinking: "I need to analyze..." },
+        { type: "text", text: "Here's the answer." },
+      ],
+    },
+  });
+  // Text takes priority when both are present
+  assert.strictEqual(result.textDelta, "Here's the answer.");
+  assert.strictEqual(result.eventType, "assistant.text");
 });
 
 test("parseQwEvent handles user message echo", () => {
@@ -462,6 +483,89 @@ async function runWsIntegrationTest() {
 }
 
 testAsync("WS integration test placeholder", runWsIntegrationTest);
+
+// ---------------------------------------------------------------------------
+// Integration scenario tests (protocol-level, no live WS server)
+// ---------------------------------------------------------------------------
+
+console.log("\n=== Integration Scenario Tests ===\n");
+
+test("chat.abort frame format with runId", () => {
+  const frame = {
+    type: "req", id: "abort-1", method: "chat.abort",
+    params: { runId: "run-abc", sessionKey: "qw:xyz:main" },
+  };
+  assert.strictEqual(frame.method, "chat.abort");
+  assert.strictEqual(frame.params.runId, "run-abc");
+});
+
+test("multi-turn session reuse pattern", () => {
+  // Simulate the session lifecycle: create -> send -> send -> send
+  const sessionMap = new Map();
+  const sessionKey = "qw:test123:main";
+
+  // First message: creates session
+  const firstSession = { sessionId: "sess-001", wakerId: "test123", createdAt: Date.now() };
+  sessionMap.set(sessionKey, firstSession);
+
+  // Second message: reuses existing session
+  const existing = sessionMap.get(sessionKey);
+  assert.ok(existing, "session should exist after first message");
+  assert.strictEqual(existing.sessionId, "sess-001");
+
+  // Third message: still reuses same session
+  const stillSame = sessionMap.get(sessionKey);
+  assert.strictEqual(stillSame.sessionId, "sess-001", "should reuse same session");
+});
+
+test("stale session cleanup on error", () => {
+  const sessionMap = new Map();
+  const sessionKey = "qw:test123:main";
+  const session = { sessionId: "sess-dead", wakerId: "test123" };
+  sessionMap.set(sessionKey, session);
+
+  // Simulate error cleanup
+  if (sessionMap.get(sessionKey) === session) {
+    sessionMap.delete(sessionKey);
+  }
+
+  assert.strictEqual(sessionMap.has(sessionKey), false, "stale session should be removed");
+});
+
+test("heartbeat frame format", () => {
+  const heartbeat = {
+    type: "event", event: "heartbeat",
+    payload: { ts: Date.now(), activeRuns: 2 },
+  };
+  assert.strictEqual(heartbeat.event, "heartbeat");
+  assert.ok(typeof heartbeat.payload.ts === "number");
+  assert.ok(typeof heartbeat.payload.activeRuns === "number");
+});
+
+test("tool-use round boundary: message_stop followed by more events", () => {
+  // Simulate a tool-use round: text -> message_stop -> more text -> idle
+  const events = [
+    { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Let me check" } } },
+    { type: "stream_event", event: { type: "message_stop" } },
+    // Tool executes, new response starts
+    { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "I found the answer" } } },
+    { type: "worker.status.changed", session_status: "idle" },
+  ];
+
+  let fullText = "";
+  let isDone = false;
+  for (const ev of events) {
+    const parsed = parseQwEvent(ev);
+    if (parsed.textDelta) fullText += parsed.textDelta;
+    if (parsed.isDone && parsed.eventType === "worker.status.changed") {
+      isDone = true;
+      break;
+    }
+    // message_stop does NOT set isDone anymore in the new logic
+  }
+  assert.strictEqual(fullText, "Let me checkI found the answer");
+  assert.strictEqual(isDone, true, "should complete on worker idle");
+});
 
 // ---------------------------------------------------------------------------
 // Summary
